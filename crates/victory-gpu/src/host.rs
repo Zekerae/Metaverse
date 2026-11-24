@@ -12,10 +12,10 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{s, Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -176,7 +176,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -1935,6 +1935,25 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
+        // If running in a background session or private virtual desktop (e.g. agent sandbox),
+        // attach this thread to the interactive user desktop "Default" so the DirectX 12 game window
+        // is physically visible on the user's screen.
+        if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
+            type OpenDesktopWFn = unsafe extern "system" fn(*const u16, u32, i32, u32) -> isize;
+            type SetThreadDesktopFn = unsafe extern "system" fn(isize) -> i32;
+            let open_desk: Option<OpenDesktopWFn> =
+                std::mem::transmute(GetProcAddress(user32, s!("OpenDesktopW")));
+            let set_desk: Option<SetThreadDesktopFn> =
+                std::mem::transmute(GetProcAddress(user32, s!("SetThreadDesktop")));
+            if let (Some(open_desk), Some(set_desk)) = (open_desk, set_desk) {
+                let name: Vec<u16> = "Default\0".encode_utf16().collect();
+                let hdesk = open_desk(name.as_ptr(), 0, 0, 0x1ff);
+                if hdesk != 0 {
+                    let _ = set_desk(hdesk);
+                }
+            }
+        }
+
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -1952,7 +1971,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
@@ -1965,7 +1984,10 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        let _ = SetForegroundWindow(hwnd);
+        Ok(hwnd)
     }
 }
 

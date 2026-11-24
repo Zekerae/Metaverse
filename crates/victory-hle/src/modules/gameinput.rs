@@ -63,10 +63,11 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -403,8 +404,17 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let keys = source.keys();
+            // Ensure slot 0 (Player 1) is always connected, using keyboard fallback if no physical gamepad
+            if pads[0].is_none() {
+                pads[0] = Some(fallback(&keys));
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(ref mut p) = pads[0] {
+                p.buttons |= fallback(&keys).buttons;
+            }
+            (pads, keys)
         };
         let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);

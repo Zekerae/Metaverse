@@ -153,7 +153,16 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
-    if base.is_null() {
+    if at.is_null() {
+        let error = std::io::Error::last_os_error();
+        tracing::error!(
+            size,
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            %error,
+            "XMemVirtualAlloc failed"
+        );
+    } else if base.is_null() {
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
@@ -287,6 +296,11 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         );
     }
     let Some(layout) = layout(size, attributes) else {
+        tracing::error!(
+            size,
+            attributes = format_args!("{attributes:#x}"),
+            "XMemAllocDefault: layout failed"
+        );
         return std::ptr::null_mut();
     };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
@@ -296,6 +310,11 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
+        tracing::error!(
+            size,
+            align = layout.align(),
+            "XMemAllocDefault: host alloc failed"
+        );
         return block.cast();
     }
     // SAFETY: the block holds the alignment (at least the header) and then
@@ -486,6 +505,8 @@ impl View {
             )
         };
         if at.Value.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::error!(offset, len, %error, "View::map: MapViewOfFile failed");
             return None;
         }
         let view = View { at, len };
@@ -713,7 +734,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         )
     };
     if view.Value as usize != base {
-        tracing::warn!(
+        tracing::error!(
             address = format_args!("{base:#x}"),
             len,
             error = %std::io::Error::last_os_error(),
@@ -751,7 +772,7 @@ fn commit(base: usize, len: usize) -> bool {
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
         victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
     } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
+        tracing::error!(len, %error, "committing physical pages failed");
     }
     false
 }

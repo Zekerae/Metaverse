@@ -32,6 +32,16 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    if let Some(build) = victory_game::identify(&hash) {
+        #[cfg(windows)]
+        unsafe {
+            if let Err(e) = build.apply_hooks(image.base()) {
+                eprintln!("warning: applying hooks failed: {e}");
+            } else {
+                println!("hooks          applied for {}", build.label);
+            }
+        }
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -102,6 +112,7 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    victory_loader::watch_map_data_store(image.base());
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);

@@ -11,5 +11,8 @@ publish.workspace = true
 memchr.workspace = true
 miniz_oxide.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
+
 [lints]
 workspace = true

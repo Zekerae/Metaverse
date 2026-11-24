@@ -11,6 +11,7 @@
 //! often states the reason. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -119,7 +120,7 @@ pub fn report_crashes() {
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
     unsafe {
-        AddVectoredExceptionHandler(0, Some(handler));
+        AddVectoredExceptionHandler(1, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
     }
 }
@@ -356,9 +357,479 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// Decodes the byte length of an indirect `call [memory]` or `call reg` instruction (`ff /2`).
+fn indirect_call_len(code: *const u8, room: usize) -> Option<usize> {
+    if room < 2 {
+        return None;
+    }
+    // SAFETY: caller verified that at least `room` bytes are within the mapped page.
+    let b0 = unsafe { *code };
+    let (_rex, at) = if (0x40..=0x4f).contains(&b0) {
+        (b0, 1)
+    } else {
+        (0, 0)
+    };
+    if at + 2 > room || unsafe { *code.add(at) } != 0xff {
+        return None;
+    }
+    let modrm = unsafe { *code.add(at + 1) };
+    let mod_val = modrm >> 6;
+    let reg_val = (modrm >> 3) & 7;
+    if reg_val != 2 {
+        return None;
+    }
+    if mod_val == 3 {
+        return Some(at + 2);
+    }
+    let rm = modrm & 7;
+    let mut len = at + 2;
+    let mut base = rm;
+    if rm == 4 {
+        if len >= room {
+            return None;
+        }
+        let sib = unsafe { *code.add(len) };
+        base = sib & 7;
+        len += 1;
+    }
+    let disp_len = match mod_val {
+        0 if rm == 5 || (rm == 4 && base == 5) => 4,
+        1 => 1,
+        2 => 4,
+        _ => 0,
+    };
+    if len + disp_len > room {
+        return None;
+    }
+    Some(len + disp_len)
+}
+
+fn safe_hex_dump(addr: usize, len: usize) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if addr < 0x1000 || addr > 0x7FFE_00000000 {
+        return format!("    {addr:#x} (invalid/non-canonical pointer)\n");
+    }
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD != 0) || (info.Protect & 0xff == PAGE_NOACCESS) {
+        return format!("    {addr:#x} (unreadable or not committed)\n");
+    }
+    let bytes_in_page = (0x1000 - (addr & 0xfff)).min(len);
+    let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, bytes_in_page) };
+    let mut out = String::new();
+    for (i, chunk) in slice.chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .collect();
+        out.push_str(&format!("    {:#010x}: {:<48} |{}|\n", addr + i * 16, hex.join(" "), ascii));
+    }
+    out
+}
+
+fn safe_read_u64(addr: usize) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if addr < 0x1000 || addr > 0x7FFE_00000000 || addr % 8 != 0 {
+        return None;
+    }
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD != 0) || (info.Protect & 0xff == PAGE_NOACCESS) {
+        return None;
+    }
+    Some(unsafe { *(addr as *const u64) })
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HookCounts {
+    pub hook33a: u64,
+    pub hook33b: u64,
+}
+
+fn hook33_counts() -> HookCounts {
+    type FnCounts = extern "C" fn() -> HookCounts;
+    unsafe {
+        let h = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        if !h.is_null() {
+            let proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                h,
+                c"victory_game_hook33_counts".as_ptr().cast(),
+            );
+            if let Some(f) = proc {
+                let f: FnCounts = std::mem::transmute(f);
+                return f();
+            }
+        }
+        HookCounts::default()
+    }
+}
+
+fn module_rva(address: usize) -> Option<usize> {
+    let mut module: HMODULE = std::ptr::null_mut();
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+    Some(address - module as usize)
+}
+
+/// Recovers from attempts to execute unmapped or invalid function pointers
+/// (such as pure-virtual / unimplemented vtable slots, NULL, or sentinel tokens like 0x103),
+/// or read access violations on indirect `call [reg + disp]` instructions where the vtable
+/// or target pointer is invalid.
+unsafe fn emulate_invalid_call(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: system-provided exception pointers.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let context = unsafe { &mut *(*info).ContextRecord };
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION {
+        return false;
+    }
+
+    let access_kind = record.ExceptionInformation[0];
+    let fault_target = record.ExceptionInformation[1] as usize;
+
+    static READ_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+    static EXEC_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+    // Case 1: Read access violation on an indirect `call [memory]` instruction.
+    if access_kind == 0 {
+        let rip = context.Rip as usize;
+        let room = 0x1000 - (rip & 0xfff);
+        if let Some(call_len) = indirect_call_len(rip as *const u8, room) {
+            // Target being read is outside mapped module memory.
+            if fault_target < 0x10000
+                || fault_target > 0x7FFE_00000000
+                || module_of(fault_target).is_none()
+            {
+                let count = READ_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                if count == 0 {
+                    let counts = hook33_counts();
+                    let (h33a, h33b) = (counts.hook33a, counts.hook33b);
+                    let rva = module_rva(rip).unwrap_or(0);
+                    let mut dump = String::new();
+                    dump.push_str("\n==================== VIctory Diagnostic Dump: first invalid call memory read (total == 1) ====================\n");
+                    dump.push_str(&format!(
+                        "Fault target read: {fault_target:#x}, Caller instruction: {} (RVA {rva:#x}), Call length: {call_len}\n",
+                        locate(rip),
+                    ));
+                    dump.push_str(&format!(
+                        "Active Hook 33 counts: Hook 33A (0x4da62a0) = {h33a}, Hook 33B (0x5312d20) = {h33b}\n"
+                    ));
+                    dump.push_str(&format!(
+                        "Registers:\n  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}\n  r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}\n",
+                        context.Rax, context.Rbx, context.Rcx, context.Rdx,
+                        context.Rsi, context.Rdi, context.Rsp, context.Rbp,
+                        context.R8, context.R9, context.R10, context.R11,
+                        context.R12, context.R13, context.R14, context.R15,
+                    ));
+                    dump.push_str("Call Stack:\n");
+                    for (i, pc) in unwind(*context).into_iter().enumerate() {
+                        dump.push_str(&format!("  #{i:<2} {}\n", locate(pc as usize)));
+                    }
+                    dump.push_str(&format!("Memory at rdi ({:#x}):\n", context.Rdi));
+                    dump.push_str(&safe_hex_dump(context.Rdi as usize, 0x80));
+                    dump.push_str(&format!("Memory at rbx ({:#x}):\n", context.Rbx));
+                    dump.push_str(&safe_hex_dump(context.Rbx as usize, 0x80));
+                    dump.push_str("===============================================================================================================\n\n");
+                    eprint!("{dump}");
+                    append_to_log(&dump);
+                } else if count < 20 || count % 1000 == 0 {
+                    eprintln!(
+                        "VIctory: recovered from invalid call memory read at {:#x} (caller {}, call length {}, total {})",
+                        fault_target,
+                        locate(rip),
+                        call_len,
+                        count + 1
+                    );
+                }
+                context.Rip += call_len as u64;
+                context.Rax = 0;
+                // SAFETY: access to union field to zero return register XMM0.
+                unsafe {
+                    context.Anonymous.FltSave.XmmRegisters[0].Low = 0;
+                    context.Anonymous.FltSave.XmmRegisters[0].High = 0;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Writes are never call faults.
+    if access_kind == 1 {
+        return false;
+    }
+
+    // Case 2: Execute access violation (DEP or unmapped target).
+    // If the fault target is inside a valid loaded module and > 0x10000, let normal crash reporting handle it.
+    if fault_target > 0x10000 && module_of(fault_target).is_some() {
+        return false;
+    }
+    // Verify stack bounds before reading [RSP]
+    let (mut low, mut high) = (0, 0);
+    // SAFETY: current thread stack limits.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let rsp = context.Rsp as usize;
+    if rsp < low || rsp + 8 > high {
+        return false;
+    }
+    let ret_addr = unsafe { *(rsp as *const u64) };
+    // The return address must be inside a loaded module (the calling function)
+    if module_of(ret_addr as usize).is_none() {
+        return false;
+    }
+
+    let count = EXEC_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+    let rva = module_rva(ret_addr as usize).unwrap_or(0);
+    static HIT_4E4F47D: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HIT_258B7FE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    let is_first_total = count == 0;
+    let is_first_4e4f47d = rva == 0x4e4f47d && !HIT_4E4F47D.swap(true, Ordering::Relaxed);
+    let is_first_258b7fe = rva == 0x258b7fe && !HIT_258B7FE.swap(true, Ordering::Relaxed);
+
+    if is_first_total || is_first_4e4f47d || is_first_258b7fe {
+        let counts = hook33_counts();
+        let (h33a, h33b) = (counts.hook33a, counts.hook33b);
+        let reason = if is_first_total {
+            "first recovered invalid execution (total == 1)"
+        } else if is_first_4e4f47d {
+            "first hit of +0x4e4f47d (PoolArray dispatch)"
+        } else {
+            "first hit of +0x258b7fe (Chunk Header virtual call)"
+        };
+
+        let mut dump = String::new();
+        dump.push_str(&format!(
+            "\n==================== VIctory Diagnostic Dump: {reason} ====================\n"
+        ));
+        dump.push_str(&format!(
+            "Fault target: {fault_target:#x}, Caller return site: {} (RVA {rva:#x}), Total: {}\n",
+            locate(ret_addr as usize),
+            count + 1
+        ));
+        dump.push_str(&format!(
+            "Active Hook 33 counts: Hook 33A (0x4da62a0) = {h33a}, Hook 33B (0x5312d20) = {h33b}\n"
+        ));
+        dump.push_str(&format!(
+            "Registers:\n  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}\n  r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}\n",
+            context.Rax, context.Rbx, context.Rcx, context.Rdx,
+            context.Rsi, context.Rdi, context.Rsp, context.Rbp,
+            context.R8, context.R9, context.R10, context.R11,
+            context.R12, context.R13, context.R14, context.R15,
+        ));
+        dump.push_str("Call Stack:\n");
+        for (i, pc) in unwind(*context).into_iter().enumerate() {
+            dump.push_str(&format!("  #{i:<2} {}\n", locate(pc as usize)));
+        }
+        dump.push_str(&format!("Memory at rdi ({:#x}):\n", context.Rdi));
+        dump.push_str(&safe_hex_dump(context.Rdi as usize, 0x80));
+        if let Some(vtable_rdi) = safe_read_u64(context.Rdi as usize) {
+            dump.push_str(&format!("Memory at *(u64*)rdi ({vtable_rdi:#x}):\n"));
+            dump.push_str(&safe_hex_dump(vtable_rdi as usize, 0x80));
+        } else {
+            dump.push_str("  *(u64*)rdi is not readable or invalid\n");
+        }
+        dump.push_str(&format!("Memory at rbx ({:#x}):\n", context.Rbx));
+        dump.push_str(&safe_hex_dump(context.Rbx as usize, 0x80));
+        if let Some(vtable_rbx) = safe_read_u64(context.Rbx as usize) {
+            dump.push_str(&format!("Memory at *(u64*)rbx ({vtable_rbx:#x}):\n"));
+            dump.push_str(&safe_hex_dump(vtable_rbx as usize, 0x80));
+        } else {
+            dump.push_str("  *(u64*)rbx is not readable or invalid\n");
+        }
+        dump.push_str("================================================================================\n\n");
+        eprint!("{dump}");
+        append_to_log(&dump);
+    } else if count < 20 || count % 1000 == 0 {
+        eprintln!(
+            "VIctory: recovered from invalid execution at {:#x} (caller {}, total {})",
+            fault_target,
+            locate(ret_addr as usize),
+            count + 1
+        );
+    }
+    context.Rip = ret_addr;
+    context.Rsp += 8;
+    context.Rax = 0;
+    // SAFETY: access to union field to zero return register XMM0.
+    unsafe {
+        context.Anonymous.FltSave.XmmRegisters[0].Low = 0;
+        context.Anonymous.FltSave.XmmRegisters[0].High = 0;
+    }
+    true
+}
+
+const WATCH_TARGET_RVA: usize = 0xa024230;
+const WATCH_RDATA_START_RVA: usize = 0x5f41000;
+const WATCH_RDATA_END_RVA: usize = 0x67e2000;
+
+static WATCH_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
+static WATCH_TARGET_ADDR: AtomicU64 = AtomicU64::new(0);
+static WATCH_LAST_VAL: AtomicU64 = AtomicU64::new(0);
+static WATCH_WORKER_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn arm_hw_watchpoint_tid(tid: u32, target: u64) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext};
+    use windows_sys::Win32::System::Threading::{
+        OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT,
+        THREAD_SUSPEND_RESUME,
+    };
+    const CONTEXT_AMD64: u32 = 0x0010_0000;
+    const CONTEXT_DEBUG_REGISTERS: u32 = CONTEXT_AMD64 | 0x10;
+
+    unsafe {
+        let h = OpenThread(
+            THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+            0,
+            tid,
+        );
+        if h.is_null() {
+            return;
+        }
+        if SuspendThread(h) != u32::MAX {
+            let mut ctx = Aligned16(std::mem::zeroed());
+            ctx.0.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if GetThreadContext(h, &mut ctx.0) != 0 {
+                ctx.0.Dr0 = target;
+                ctx.0.Dr6 = 0;
+                // L0=1 (bit 0), RW0=01 (write, bits 16..17), LEN0=11 (4 bytes, bits 18..19)
+                ctx.0.Dr7 = (ctx.0.Dr7 & !0x000f_0003) | 0x000d_0001;
+                if SetThreadContext(h, &ctx.0) == 0 {
+                    eprintln!("VIctory: SetThreadContext(Dr0) failed on tid {tid}");
+                }
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+}
+
+/// Arms an x86-64 hardware write-watchpoint (`Dr0`, 8 bytes) on `image+0xa024230`
+/// across all existing and future threads.
+pub fn watch_map_data_store(image_base: usize) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+
+    let target = (image_base + WATCH_TARGET_RVA) as u64;
+    WATCH_IMAGE_BASE.store(image_base as u64, Ordering::Relaxed);
+    WATCH_LAST_VAL.store(unsafe { *(target as *const u64) }, Ordering::Relaxed);
+    WATCH_TARGET_ADDR.store(target, Ordering::Release);
+
+    std::thread::spawn(move || {
+        use std::collections::HashMap;
+        let worker_tid = unsafe { GetCurrentThreadId() };
+        WATCH_WORKER_TID.store(worker_tid, Ordering::Release);
+        let mut armed_count: HashMap<u32, u8> = HashMap::new();
+        loop {
+            let pid = unsafe { GetCurrentProcessId() };
+            unsafe {
+                let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snap != -1isize as *mut _ {
+                    let mut te: THREADENTRY32 = std::mem::zeroed();
+                    te.dwSize = size_of_val(&te) as u32;
+                    if Thread32First(snap, &mut te) != 0 {
+                        loop {
+                            if te.th32OwnerProcessID == pid && te.th32ThreadID != worker_tid {
+                                let c = armed_count.entry(te.th32ThreadID).or_insert(0);
+                                if *c < 3 {
+                                    arm_hw_watchpoint_tid(te.th32ThreadID, target);
+                                    *c += 1;
+                                }
+                            }
+                            if Thread32Next(snap, &mut te) == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    CloseHandle(snap);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    eprintln!("VIctory: armed HW write-watchpoint (Dr0) on image+0xa024230 ({target:#x})");
+}
+
+unsafe fn handle_watchpoint(info: *mut EXCEPTION_POINTERS) -> bool {
+    use windows_sys::Win32::Foundation::EXCEPTION_SINGLE_STEP;
+
+    let target_addr = WATCH_TARGET_ADDR.load(Ordering::Acquire) as usize;
+    if target_addr == 0 {
+        return false;
+    }
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let context = unsafe { &mut *(*info).ContextRecord };
+
+    if record.ExceptionCode == EXCEPTION_SINGLE_STEP && (context.Dr6 & 1) != 0 {
+        context.Dr6 &= !1;
+        let new_val = unsafe { *(target_addr as *const u64) };
+        let old_val = WATCH_LAST_VAL.swap(new_val, Ordering::SeqCst);
+        let image_base = WATCH_IMAGE_BASE.load(Ordering::Relaxed) as usize;
+        let rdata_start = image_base + WATCH_RDATA_START_RVA;
+        let rdata_end = image_base + WATCH_RDATA_END_RVA;
+        let in_rdata = (new_val as usize) >= rdata_start && (new_val as usize) < rdata_end;
+        let rip = context.Rip as usize;
+        let tag = if in_rdata {
+            "HW write to [image+0xa024230] (in .rdata)"
+        } else {
+            "!!! HW NON-.RDATA OVERWRITE OF [image+0xa024230] !!!"
+        };
+        let mut msg = format!(
+            "\n==================== VIctory Watchpoint: {tag} ====================\n\
+             Next instruction (after write): {}\n\
+             Old [image+0xa024230]: {old_val:#x}\n\
+             New [image+0xa024230]: {new_val:#x} (in_rdata={in_rdata})\n",
+            locate(rip),
+        );
+        if !in_rdata {
+            msg.push_str(&format!(
+                "Registers:\n  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}\n  r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}\n",
+                context.Rax, context.Rbx, context.Rcx, context.Rdx,
+                context.Rsi, context.Rdi, context.Rsp, context.Rbp,
+                context.R8, context.R9, context.R10, context.R11,
+                context.R12, context.R13, context.R14, context.R15,
+            ));
+            msg.push_str("Call Stack:\n");
+            for (i, pc) in unwind(*context).into_iter().enumerate() {
+                msg.push_str(&format!("  #{i:<2} {}\n", locate(pc as usize)));
+            }
+        }
+        msg.push_str("=========================================================================\n");
+        eprint!("{msg}");
+        append_to_log(&msg);
+        return true;
+    }
+    false
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
+    if unsafe { handle_watchpoint(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: system passes valid exception pointers; recovers unmapped virtual calls.
+    if unsafe { emulate_invalid_call(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.

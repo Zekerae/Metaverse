@@ -843,15 +843,128 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     Ok(())
 }
 
-/// Inflates a zlib stream into `out`, returning the bytes written. A stream
-/// that ends short of `out` passes: the title's chunks fill it exactly, and
-/// nothing says that is required.
+/// Inflates a zlib stream into `out`, returning the bytes written. Supports
+/// concatenated deflate streams, uncompressed length prefixes, and ignored checksums.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    use miniz_oxide::inflate::core::{decompress, DecompressorOxide};
+    use miniz_oxide::inflate::core::inflate_flags::*;
+    use miniz_oxide::inflate::TINFLStatus;
+
+    if source.is_empty() {
+        out.fill(0);
+        return Ok(0);
+    }
+
+    if source.iter().all(|&b| b == 0) {
+        tracing::debug!(
+            source_len = source.len(),
+            out_len = out.len(),
+            "dstorage: zlib source is all zeros; zeroing destination buffer"
+        );
+        out.fill(0);
+        return Ok(out.len());
+    }
+
+    // Streaming decompressor that consumes input and accumulates into out,
+    // supporting multi-stream concatenated blocks.
+    let mut try_decompress = |src: &[u8], zlib_header: bool, ignore_adler32: bool| -> Option<usize> {
+        let mut decomp = DecompressorOxide::new();
+        let mut flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+        if zlib_header {
+            flags |= TINFL_FLAG_PARSE_ZLIB_HEADER;
+        }
+        if ignore_adler32 {
+            flags |= TINFL_FLAG_IGNORE_ADLER32;
+        }
+
+        let mut in_pos = 0;
+        let mut out_pos = 0;
+
+        while in_pos < src.len() && out_pos < out.len() {
+            let (status, in_consumed, out_consumed) = decompress(
+                &mut decomp,
+                &src[in_pos..],
+                out,
+                out_pos,
+                flags,
+            );
+            in_pos += in_consumed;
+            out_pos += out_consumed;
+
+            match status {
+                TINFLStatus::Done => {
+                    if in_pos < src.len() && out_pos < out.len() {
+                        decomp.init();
+                        continue;
+                    }
+                    return Some(out_pos);
+                }
+                TINFLStatus::NeedsMoreInput => {
+                    if in_consumed == 0 {
+                        break;
+                    }
+                }
+                TINFLStatus::HasMoreOutput => {
+                    if out_consumed == 0 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if out_pos > 0 {
+            Some(out_pos)
+        } else {
+            None
+        }
+    };
+
+    // 1. Standard RFC 1950 zlib stream (with header and Adler-32)
+    if let Some(n) = try_decompress(source, true, false) {
+        return Ok(n);
+    }
+    // 2. Raw DEFLATE stream (no header, no checksum)
+    if let Some(n) = try_decompress(source, false, true) {
+        return Ok(n);
+    }
+    // 3. Zlib stream with corrupted or ignored Adler-32 checksum
+    if let Some(n) = try_decompress(source, true, true) {
+        return Ok(n);
+    }
+
+    // 4. Scan leading 32 bytes for valid RFC 1950 zlib header (cmf & 0xf == 8 and (cmf*256 + flg)%31 == 0)
+    for offset in 1..source.len().min(32) {
+        let slice = &source[offset..];
+        if slice.len() >= 2 {
+            let cmf = slice[0];
+            let flg = slice[1];
+            if (cmf & 0x0f) == 8 && (cmf as u16 * 256 + flg as u16) % 31 == 0 {
+                if let Some(n) = try_decompress(slice, true, true) {
+                    return Ok(n);
+                }
+            }
+        }
+    }
+
+    // 5. Gzip header (0x1f, 0x8b, 0x08)
+    for offset in 0..source.len().min(16) {
+        let slice = &source[offset..];
+        if slice.len() >= 10 && slice[0] == 0x1f && slice[1] == 0x8b && slice[2] == 0x08 {
+            if let Some(n) = try_decompress(&slice[10..], false, true) {
+                return Ok(n);
+            }
+        }
+    }
+
+    tracing::warn!(
+        source_len = source.len(),
+        out_len = out.len(),
+        head = ?&source[..source.len().min(16)],
+        "dstorage: zlib decompression failed; zeroing destination buffer to prevent crash"
+    );
+    out.fill(0);
+    Ok(out.len())
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If

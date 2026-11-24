@@ -834,6 +834,12 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Format 67 (DXGI_FORMAT_R9G9B9E5_SHAREDEXP) does not support UAV or RTV on host D3D12.
+    const R9G9B9E5_SHAREDEXP: u32 = 67;
+    const RENDER_TARGET: u32 = 1;
+    if d.format == R9G9B9E5_SHAREDEXP {
+        d.flags &= !(RENDER_TARGET | UNORDERED);
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -842,6 +848,11 @@ fn host_texture(
         value[0] = pc_format(value[0]);
         value
     });
+    let clear_opt = if (d.flags & (RENDER_TARGET | DEPTH)) != 0 {
+        clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast())
+    } else {
+        None
+    };
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -849,7 +860,7 @@ fn host_texture(
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
-    let made = unsafe {
+    let mut made = unsafe {
         host.device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
@@ -858,10 +869,45 @@ fn host_texture(
                 crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
             ),
             // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+            clear_opt,
             &mut texture,
         )
     };
+    if made.is_err() && d.flags & UNORDERED != 0 {
+        d.flags &= !UNORDERED;
+        let clear_retry = if (d.flags & (RENDER_TARGET | DEPTH)) != 0 {
+            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast())
+        } else {
+            None
+        };
+        made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+                clear_retry,
+                &mut texture,
+            )
+        };
+    }
+    if made.is_err() && d.flags != 0 {
+        d.flags = 0;
+        made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+                None,
+                &mut texture,
+            )
+        };
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
