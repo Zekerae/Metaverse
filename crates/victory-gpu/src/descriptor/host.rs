@@ -509,6 +509,14 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+static VIEW_LIMIT_CAPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn cap_view_limit() {
+    VIEW_LIMIT_CAPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+    victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+}
+
 /// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
 /// and if so tells the translator now (`set_view_heap_limit`) instead of
 /// when the title's heap is made: a shader keeps the limit it was
@@ -523,6 +531,23 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: plain feature query on a live device.
+        let tier_ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+        };
+        if tier_ok.is_ok() && opts.ResourceBindingTier.0 < D3D12_RESOURCE_BINDING_TIER_3.0 {
+            tracing::info!(
+                tier = opts.ResourceBindingTier.0,
+                "the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on"
+            );
+            cap_view_limit();
+            return;
+        }
         // SAFETY: plain heap creation; the heap is released at once.
         let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
             host.device
@@ -535,7 +560,7 @@ pub(crate) fn probe_view_limit() {
         };
         if made.is_err() {
             tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
-            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+            cap_view_limit();
         }
     });
 }
@@ -574,20 +599,43 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. The heap's last slot stays null, and shaders read it for
-                // any view index from there on (`set_view_heap_limit`): a read past the heap's
-                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
-                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        if !sampler {
+            probe_view_limit();
+        }
+        let pre_capped = !sampler
+            && count + extra > PORTABLE_VIEWS
+            && VIEW_LIMIT_CAPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let (heap, count, size) = if pre_capped {
+            tracing::warn!(
+                count,
+                "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot"
+            );
+            cap_view_limit();
+            (
+                make(PORTABLE_VIEWS).ok()?,
+                PORTABLE_VIEWS - extra - 1,
+                PORTABLE_VIEWS,
+            )
+        } else {
+            match make(count + extra) {
+                Ok(heap) => (heap, count, count + extra),
+                Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
+                    // shortcut: descriptors past the host's limit are left out; a title that reaches
+                    // them needs remapping. The heap's last slot stays null, and shaders read it for
+                    // any view index from there on (`set_view_heap_limit`): a read past the heap's
+                    // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
+                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
+                    cap_view_limit();
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - extra - 1,
+                        PORTABLE_VIEWS,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
         // SAFETY: a live heap.

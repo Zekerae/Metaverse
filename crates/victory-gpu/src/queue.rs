@@ -750,10 +750,41 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+#[cfg(windows)]
+fn detect_plane_stride(base: usize, token0: u64) -> usize {
+    static STRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cached = STRIDE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    const CANDIDATES: [usize; 14] = [80, 88, 96, 104, 112, 120, 128, 72, 64, 56, 48, 40, 32, 24];
+    for match_token in [true, false] {
+        for &stride in &CANDIDATES {
+            // SAFETY: `plane_parameters` has `planes >= 2` elements; we validate
+            // `count` and pointer alignment before dereferencing `resources`.
+            let cand = unsafe { &*((base + stride) as *const Plane) };
+            if match_token && cand.token != token0 {
+                continue;
+            }
+            if !(1..=8).contains(&cand.count) {
+                continue;
+            }
+            let ptr = cand.resources as usize;
+            if ptr < 0x10000 || !ptr.is_multiple_of(8) {
+                continue;
+            }
+            let res = unsafe { *cand.resources };
+            if crate::resource::host_resource(res).is_some() {
+                STRIDE.store(stride, Ordering::Relaxed);
+                return stride;
+            }
+        }
+    }
+    size_of::<Plane>()
+}
+
+/// Shows the title's planes in our window (compositing multiple planes
+/// when `planes > 1`).
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -816,24 +847,80 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let base = plane_parameters as usize;
+        // SAFETY: `planes > 0` and `plane_parameters` is non-null.
+        let plane0 = unsafe { &*plane_parameters };
+        let stride = if planes > 1 {
+            detect_plane_stride(base, plane0.token)
+        } else {
+            size_of::<Plane>()
+        };
+        let mut collected: Vec<(This, &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
+            Vec::with_capacity((planes as usize).min(8));
+        for i in 0..(planes as usize).min(8) {
+            // SAFETY: `i < planes`, stride is validated for `planes > 1`.
+            let plane = unsafe { &*((base + i * stride) as *const Plane) };
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: `plane.count > 0` and `plane.resources` is non-null.
+            let resource = unsafe { *plane.resources };
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                let target_state = if planes > 1 { 0x80 } else { 0x800 };
+                let state = crate::resource::host_transition(resource, target_state)
+                    .map_or(target_state, |(_, before)| before);
+                collected.push((resource, texture, state));
+            }
+        }
+        if planes > 1 || plane0.count > 1 {
+            static MULTI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !MULTI.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    frame,
+                    planes,
+                    stride,
+                    plane0_count = plane0.count,
+                    "PresentX multi-plane layout"
+                );
+                for (i, &(res, tex, st)) in collected.iter().enumerate() {
+                    // SAFETY: live D3D12 resource and `plane_parameters` entry.
+                    let (desc, color_space) = unsafe {
+                        let d = tex.GetDesc();
+                        let cs = if stride >= 28 {
+                            *((base + i * stride + 24) as *const u32)
+                        } else {
+                            0
+                        };
+                        (d, cs)
+                    };
+                    tracing::info!(
+                        plane = i,
+                        resource = ?res,
+                        width = desc.Width,
+                        height = desc.Height,
+                        format = desc.Format.0,
+                        color_space,
+                        state = format_args!("{st:#x}"),
+                        "PresentX plane"
+                    );
+                }
+            }
+        }
+        if !collected.is_empty() {
+            let pairs: Vec<_> = collected.iter().map(|&(_, tex, st)| (tex, st)).collect();
+            let shown = host.present_planes(&pairs, frame);
+            for &(res, _, st) in &collected {
+                crate::resource::host_transition(res, st);
+            }
+            let &(res0, _, st0) = &collected[0];
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, res0, st0, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (res0, st0, shown);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

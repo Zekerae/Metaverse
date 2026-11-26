@@ -66,6 +66,33 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame a hash last found the texture's memory changed in.
+    changed: Option<u64>,
+}
+
+impl Last {
+    /// Takes `hash` as the hash of the texture's memory; true when it
+    /// differs from the last one, and then the frame is noted.
+    fn rehash(&mut self, hash: blake3::Hash) -> bool {
+        if self.hash == Some(hash) {
+            return false;
+        }
+        self.hash = Some(hash);
+        self.changed = Some(crate::frame::current());
+        true
+    }
+}
+
+const HASH_EVERY: u64 = 8;
+/// Two turns: changing textures stay current; still ones return to taking turns.
+const RECENTLY_CHANGED: u64 = 2 * HASH_EVERY;
+
+fn guard_skips(unwritten: bool, frame: u64, start: usize, changed: Option<u64>) -> bool {
+    let turn = frame
+        .wrapping_add((start >> 16) as u64)
+        .is_multiple_of(HASH_EVERY);
+    let recent = changed.is_some_and(|at| frame.wrapping_sub(at) < RECENTLY_CHANGED);
+    unwritten && !turn && !recent
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -644,17 +671,16 @@ impl Staging {
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // texture's address, so the textures take turns; and at every
+        // check for a while once it found the texture changed.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if guard_skips(unwritten, crate::frame::current(), start, last.changed) {
                 return 0;
             }
         }
@@ -693,10 +719,9 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                if !last.rehash(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -715,10 +740,9 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.rehash(hash) {
                     return size;
                 }
-                last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -731,10 +755,9 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.rehash(hash) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -753,9 +776,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if last.rehash(blake3::hash(read)) {
                 self.detile(read);
             }
             true
@@ -1056,6 +1077,44 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 }
 
 #[cfg(test)]
+mod guard_tests {
+    use super::{HASH_EVERY, RECENTLY_CHANGED, guard_skips};
+
+    fn hashed(
+        frames: std::ops::Range<u64>,
+        unwritten: bool,
+        start: usize,
+        changed: Option<u64>,
+    ) -> Vec<u64> {
+        frames
+            .filter(|&frame| !guard_skips(unwritten, frame, start, changed))
+            .collect()
+    }
+
+    #[test]
+    fn still_textures_take_turns_unless_the_guard_saw_a_write() {
+        assert_eq!(hashed(100..132, true, 0x3_0000, None), [101, 109, 117, 125]);
+        assert_eq!(hashed(100..132, true, 0x4_0000, None), [100, 108, 116, 124]);
+        assert_eq!(hashed(100..108, false, 0x3_0000, None).len(), 8);
+    }
+
+    #[test]
+    fn recently_changed_textures_are_hashed_at_every_check() {
+        let changed = Some(101);
+        let after = 101 + RECENTLY_CHANGED;
+        assert_eq!(
+            hashed(101..after, true, 0x3_0000, changed),
+            (101..after).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hashed(after..after + 2 * HASH_EVERY, true, 0x3_0000, changed),
+            [117, 125]
+        );
+        assert!(!guard_skips(true, 3, 0x3_0000, Some(u64::MAX - 2)));
+    }
+}
+
+#[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
 
@@ -1162,6 +1221,283 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+/// Compute-written textures read back to title memory (`VICTORY_TEXTURE_BACK`,
+/// on by default; `0` disables): ocean height/displacement maps so boats float.
+pub(crate) mod back {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    use crate::object::This;
+
+    fn kinds() -> &'static [(u64, u32, u32)] {
+        static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
+        KINDS.get_or_init(|| {
+            const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
+            let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
+                Ok("1") | Err(_) => DEFAULT.to_owned(),
+                Ok(spec) => spec.to_owned(),
+            };
+            let kinds: Vec<(u64, u32, u32)> = list
+                .split(',')
+                .filter_map(|k| {
+                    let (size, format) = k.trim().split_once('f')?;
+                    let (w, h) = size.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+                })
+                .collect();
+            if !kinds.is_empty() {
+                tracing::info!(
+                    ?kinds,
+                    "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)"
+                );
+            }
+            kinds
+        })
+    }
+
+    pub(crate) fn wanted(resource: This) -> bool {
+        let kinds = kinds();
+        !kinds.is_empty()
+            && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    }
+
+    struct Ticket {
+        owner: usize,
+        at: usize,
+        end: usize,
+        valid: AtomicBool,
+    }
+
+    static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+    static TRACKING: AtomicBool = AtomicBool::new(false);
+
+    fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
+        let ticket = Arc::new(Ticket {
+            owner,
+            at,
+            end,
+            valid: AtomicBool::new(true),
+        });
+        let mut tickets = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+        tickets.retain(|weak| weak.strong_count() != 0);
+        tickets.push(Arc::downgrade(&ticket));
+        TRACKING.store(true, Ordering::Relaxed);
+        ticket
+    }
+
+    fn invalidate(matches: impl Fn(&Ticket) -> bool) {
+        if !TRACKING.load(Ordering::Relaxed) {
+            return;
+        }
+        TICKETS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|weak| {
+                let Some(ticket) = weak.upgrade() else {
+                    return false;
+                };
+                if matches(&ticket) {
+                    ticket.valid.store(false, Ordering::Release);
+                }
+                true
+            });
+    }
+
+    pub(crate) fn released(owner: usize) {
+        invalidate(|ticket| ticket.owner == owner);
+    }
+
+    pub(crate) fn replaced(at: usize) {
+        invalidate(|ticket| ticket.at == at);
+    }
+
+    pub(crate) fn remapped(at: usize, len: usize) {
+        let end = at.saturating_add(len);
+        invalidate(|ticket| at < ticket.end && ticket.at < end);
+    }
+
+    pub(crate) struct Target {
+        pub(crate) copy: Arc<crate::resource::HostTexture>,
+        layout: victory_formats::texture::Layout,
+        ticket: Arc<Ticket>,
+    }
+
+    impl Target {
+        pub(crate) fn new(resource: This) -> Option<Self> {
+            let copy = crate::resource::host_copy(resource)?;
+            let _mapping = crate::watch::title_memory_reading();
+            let (layout, at, size) = crate::resource::title_texture(resource)?;
+            let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
+            let ticket = track(resource as usize, at, end);
+            Some(Self {
+                copy,
+                layout,
+                ticket,
+            })
+        }
+
+        pub(crate) fn owner(&self) -> usize {
+            self.ticket.owner
+        }
+    }
+
+    pub(crate) struct Back {
+        buffer: ID3D12Resource,
+        footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+        rows: Vec<u32>,
+        mips: u32,
+        layout: victory_formats::texture::Layout,
+        ticket: Arc<Ticket>,
+    }
+
+    pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
+        if !target.ticket.valid.load(Ordering::Acquire) {
+            return None;
+        }
+        let host = crate::host::host()?;
+        let texture = &target.copy.texture;
+        // SAFETY: live texture kept through command list state tracking.
+        let desc = unsafe { texture.GetDesc() };
+        let mips = u32::from(desc.MipLevels.max(1));
+        let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
+        let n = subresources as usize;
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+        let mut rows = vec![0u32; n];
+        let mut total = 0u64;
+        // SAFETY: out arrays of `n` entries.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                subresources,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        for (footprint, &rows) in footprints.iter().zip(&rows) {
+            let format = footprint.Footprint;
+            let pitched = u64::from(format.RowPitch)
+                .checked_mul(u64::from(rows))?
+                .checked_mul(u64::from(format.Depth))?;
+            total = total.max(footprint.Offset.checked_add(pitched)?);
+        }
+        let buffer = host.read_back_buffer(total)?;
+        for (i, footprint) in footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(&buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *footprint,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: i as u32,
+                },
+            };
+            // SAFETY: open list; texture is in COPY_SOURCE.
+            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+        Some(Back {
+            buffer,
+            footprints,
+            rows,
+            mips,
+            layout: target.layout,
+            ticket: target.ticket,
+        })
+    }
+
+    pub(crate) fn land(back: &Back) {
+        static COPIED: AtomicU64 = AtomicU64::new(0);
+        static STALE: AtomicU64 = AtomicU64::new(0);
+        let _mapping = crate::watch::title_memory_reading();
+        let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+        if !back.ticket.valid.load(Ordering::Acquire) {
+            let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+            if skipped.is_power_of_two() {
+                tracing::info!(
+                    skipped,
+                    "skipping texture readbacks whose title allocation changed"
+                );
+            }
+            return;
+        }
+        let (at, end) = (back.ticket.at, back.ticket.end);
+        let size = end - at;
+        let mut tiled = vec![0u8; size];
+        if !crate::host::read_into(at as *const u8, &mut tiled) {
+            return;
+        }
+        let mut data = std::ptr::null_mut();
+        // SAFETY: read-back buffer written by completed list.
+        unsafe {
+            if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+        }
+        for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+            let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
+            // SAFETY: subresource range inside mapped buffer.
+            let linear = unsafe {
+                std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len)
+            };
+            if let Err(e) = back.layout.tile(
+                &mut tiled,
+                mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+            ) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
+                });
+                unsafe { back.buffer.Unmap(0, None) };
+                return;
+            }
+        }
+        unsafe { back.buffer.Unmap(0, None) };
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+        let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if copied == 1 || copied.is_multiple_of(128) {
+            tracing::info!(copied, bytes = size, "texture readback landed");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_readbacks_for_changed_allocations_are_invalidated() {
+            let first = track(91, 0x1000, 0x2000);
+            let next = track(92, 0x2000, 0x3000);
+            let far = track(93, 0x4000, 0x5000);
+            remapped(0x0f00, 0x200);
+            assert!(!first.valid.load(Ordering::Acquire));
+            assert!(next.valid.load(Ordering::Acquire));
+            replaced(0x2000);
+            assert!(!next.valid.load(Ordering::Acquire));
+            assert!(far.valid.load(Ordering::Acquire));
+            released(93);
+            assert!(!far.valid.load(Ordering::Acquire));
+            assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
         }
     }
 }

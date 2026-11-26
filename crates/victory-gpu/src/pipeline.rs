@@ -62,6 +62,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    pub(crate) ambient: Option<crate::draw::ambient::Role>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -111,6 +113,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                ambient: (stage == "compute")
+                    .then(|| crate::draw::ambient::role(bytes))
+                    .flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

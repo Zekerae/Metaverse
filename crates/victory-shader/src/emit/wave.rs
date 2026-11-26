@@ -21,6 +21,8 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    AddDLo,
+    AddDHi,
     /// A sum of 16-bit floats in the low halves (`v_add_f16`), each addition rounded to 16
     /// bits: not associative, so only the balanced tree over the lanes in their order is
     /// followed (see [`buddies`]), which is how the compiler sums a wave.
@@ -60,7 +62,7 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::AddH | Op::AddDLo | Op::AddDHi | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
@@ -72,7 +74,10 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
+        matches!(
+            self,
+            Op::AddU | Op::AddF | Op::AddH | Op::AddDLo | Op::AddDHi | Op::Xor
+        )
     }
 }
 
@@ -123,6 +128,8 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
+    /// 64-bit `f64` sum over every lane: `(src_lo, src_hi, mask, is_hi)`.
+    Active64(Value, Value, Value, bool),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
 }
@@ -266,6 +273,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut exec = all;
     let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
     let mut uni: HashMap<Value, Sym> = HashMap::new();
+    let mut lo_to_hi: HashMap<(Value, Value), Value> = HashMap::new();
+    let mut hi_to_lo: HashMap<(Value, Value), Value> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
     for inst in insts {
@@ -278,7 +287,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return shapes(vec, uni, wave, &lo_to_hi, &hi_to_lo);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -293,12 +302,20 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return shapes(vec, uni, wave, &lo_to_hi, &hi_to_lo);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            if name == "s_mov_b32"
+                && let [Operand::Scalar { code, .. }] = src[..]
+                && let Some(r) = inst.read(Reg::S(code))
+                && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
+            {
+                uni.insert(w, uni.get(&r).copied().unwrap_or(Sym::Uni(r)));
+                continue;
+            }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
@@ -403,6 +420,86 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (None, Some(s)) => Some(s.clone()),
             _ => None,
         };
+        if name == "v_add_f64" && !modifiers && v.dpp.is_none() {
+            let pair = |k: usize| -> Option<(Vec<Sym>, Vec<Sym>)> {
+                match *v.src.get(k)? {
+                    Operand::Vector { reg, .. } => Some((
+                        lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni),
+                        lanes(
+                            &Operand::Vector {
+                                reg: reg + 1,
+                                dwords: 1,
+                            },
+                            &vec,
+                            &uni,
+                        ),
+                    )),
+                    Operand::Scalar { code, .. } if code != NULL => Some((
+                        lanes(&Operand::Scalar { code, dwords: 1 }, &vec, &uni),
+                        lanes(
+                            &Operand::Scalar {
+                                code: code + 1,
+                                dwords: 1,
+                            },
+                            &vec,
+                            &uni,
+                        ),
+                    )),
+                    _ => None,
+                }
+            };
+            let old_hi = lanes(
+                &Operand::Vector {
+                    reg: dreg + 1,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            let (mut r_lo, mut r_hi) = (
+                vec![Sym::Unknown; wave as usize],
+                vec![Sym::Unknown; wave as usize],
+            );
+            if let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) = (pair(0), pair(1)) {
+                for l in 0..wave as usize {
+                    let (lo, hi) = if a_lo[l] == Sym::K(0) && a_hi[l] == Sym::K(0) {
+                        (b_lo[l], b_hi[l])
+                    } else if b_lo[l] == Sym::K(0) && b_hi[l] == Sym::K(0) {
+                        (a_lo[l], a_hi[l])
+                    } else {
+                        (
+                            combine(Op::AddDLo, a_lo[l], b_lo[l]),
+                            combine(Op::AddDHi, a_hi[l], b_hi[l]),
+                        )
+                    };
+                    if let (
+                        Sym::Red {
+                            src: slo, mask, ..
+                        },
+                        Sym::Red {
+                            src: shi, mask: m2, ..
+                        },
+                    ) = (lo, hi)
+                        && mask == m2
+                    {
+                        lo_to_hi.insert((slo, mask), shi);
+                        hi_to_lo.insert((shi, mask), slo);
+                    }
+                    r_lo[l] = lo;
+                    r_hi[l] = hi;
+                }
+            }
+            let merge = |new: &[Sym], prev: &[Sym]| -> Vec<Sym> {
+                (0..wave as usize)
+                    .map(|l| if writes >> l & 1 != 0 { new[l] } else { prev[l] })
+                    .collect()
+            };
+            vec.insert(dst, merge(&r_lo, &old));
+            if let Some(dst_hi) = inst.write(Reg::V(dreg + 1)) {
+                vec.insert(dst_hi, merge(&r_hi, &old_hi));
+            }
+            continue;
+        }
         let src = |k: usize| v.src.get(k).map(|o| lanes(o, &vec, &uni));
         let result: Vec<Sym> = match (name, fetched) {
             _ if modifiers => vec![Sym::Unknown; wave as usize],
@@ -514,7 +611,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    shapes(vec, uni, wave, &lo_to_hi, &hi_to_lo)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -543,6 +640,8 @@ fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
+    lo_to_hi: &HashMap<(Value, Value), Value>,
+    hi_to_lo: &HashMap<(Value, Value), Value>,
 ) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
@@ -554,12 +653,32 @@ fn shapes(
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
+            op: Some(Op::AddDLo),
+            src,
+            mask,
+            ident: 0,
+            lanes,
+        } if lanes == all => lo_to_hi
+            .get(&(src, mask))
+            .map(|&hi| Shape::Active64(src, hi, mask, false)),
+        Sym::Red {
+            op: Some(Op::AddDHi),
+            src,
+            mask,
+            ident: 0,
+            lanes,
+        } if lanes == all => hi_to_lo
+            .get(&(src, mask))
+            .map(|&lo| Shape::Active64(lo, src, mask, true)),
+        Sym::Red {
             op: Some(op),
             src,
             mask,
             ident,
             lanes,
-        } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        } if lanes == all && !matches!(op, Op::AddDLo | Op::AddDHi) => {
+            Some(Shape::Active(op, src, mask, ident))
+        }
         _ => None,
     };
     for (v, s) in uni {
@@ -568,14 +687,25 @@ fn shapes(
         }
     }
     for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
+        if let Some(sh) = per_lane_with_pairs(&lanes, all, lo_to_hi, hi_to_lo) {
             out.insert(v, sh);
         }
     }
     out
 }
 
+#[cfg(test)]
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
+    let empty = HashMap::new();
+    per_lane_with_pairs(lanes, all, &empty, &empty)
+}
+
+fn per_lane_with_pairs(
+    lanes: &[Sym],
+    all: u64,
+    lo_to_hi: &HashMap<(Value, Value), Value>,
+    hi_to_lo: &HashMap<(Value, Value), Value>,
+) -> Option<Shape> {
     let first = lanes[0];
     let own = |l: usize, s: Sym| match s {
         Sym::Red {
@@ -597,12 +727,32 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
             Sym::K(k) => Some(Shape::K(k)),
             Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
             Sym::Red {
+                op: Some(Op::AddDLo),
+                src,
+                mask,
+                ident: 0,
+                lanes,
+            } if lanes == all => lo_to_hi
+                .get(&(src, mask))
+                .map(|&hi| Shape::Active64(src, hi, mask, false)),
+            Sym::Red {
+                op: Some(Op::AddDHi),
+                src,
+                mask,
+                ident: 0,
+                lanes,
+            } if lanes == all => hi_to_lo
+                .get(&(src, mask))
+                .map(|&lo| Shape::Active64(lo, src, mask, true)),
+            Sym::Red {
                 op: Some(op),
                 src,
                 mask,
                 ident,
                 lanes,
-            } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            } if lanes == all && !matches!(op, Op::AddDLo | Op::AddDHi) => {
+                Some(Shape::Active(op, src, mask, ident))
+            }
             _ => None,
         };
     }

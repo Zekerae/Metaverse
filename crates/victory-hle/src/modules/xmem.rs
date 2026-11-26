@@ -24,8 +24,7 @@ use windows_sys::Win32::System::Memory::{
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
-    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
-    PROCESS_MEMORY_COUNTERS,
+    K32GetPerformanceInfo, PERFORMANCE_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
@@ -49,6 +48,103 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+/// Title-allocated memory: `XMemVirtualAlloc` commits and `XMemAllocDefault` blocks.
+static VIRTUAL_COMMITS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn record_virtual_commit(start: usize, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let end = start.saturating_add(size);
+    let mut ranges = VIRTUAL_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let pos = ranges.partition_point(|&(s, _)| s <= start);
+    let mut merged_start = start;
+    let mut merged_end = end;
+    let mut remove_from = pos;
+    if pos > 0 && ranges[pos - 1].1 >= start {
+        merged_start = ranges[pos - 1].0;
+        merged_end = merged_end.max(ranges[pos - 1].1);
+        remove_from = pos - 1;
+    }
+    let mut remove_to = pos;
+    while remove_to < ranges.len() && ranges[remove_to].0 <= merged_end {
+        merged_end = merged_end.max(ranges[remove_to].1);
+        remove_to += 1;
+    }
+    ranges.splice(remove_from..remove_to, [(merged_start, merged_end)]);
+}
+
+fn remove_virtual_range(start: usize, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let end = start.saturating_add(size);
+    let mut ranges = VIRTUAL_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut i = 0;
+    while i < ranges.len() {
+        let (s, e) = ranges[i];
+        if e <= start {
+            i += 1;
+            continue;
+        }
+        if s >= end {
+            break;
+        }
+        if s < start && e > end {
+            ranges[i] = (s, start);
+            ranges.insert(i + 1, (end, e));
+            break;
+        } else if s < start {
+            ranges[i] = (s, start);
+            i += 1;
+        } else if e > end {
+            ranges[i] = (end, e);
+            break;
+        } else {
+            ranges.remove(i);
+        }
+    }
+}
+
+fn virtual_committed_bytes() -> usize {
+    let mut ranges = VIRTUAL_COMMITS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pruned: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    let mut total = 0usize;
+    // SAFETY: pseudo handle for the current process; `mbi` is plain data.
+    let process = unsafe { GetCurrentProcess() };
+    for &(start, end) in ranges.iter() {
+        let mut cur = start;
+        while cur < end {
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let queried = unsafe {
+                VirtualQueryEx(
+                    process,
+                    cur as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if queried == 0 || mbi.RegionSize == 0 {
+                break;
+            }
+            let next = cur.saturating_add(mbi.RegionSize).min(end);
+            if mbi.State == MEM_COMMIT {
+                total = total.saturating_add(next - cur);
+                if let Some(last) = pruned.last_mut()
+                    && last.1 == cur
+                {
+                    last.1 = next;
+                } else {
+                    pruned.push((cur, next));
+                }
+            }
+            cur = next;
+        }
+    }
+    *ranges = pruned;
+    total
+}
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -153,6 +249,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        record_virtual_commit(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -305,6 +404,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        HEAP_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         user.cast()
     }
 }
@@ -318,11 +418,22 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if VirtualQueryEx(
+                GetCurrentProcess(),
+                address,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+            {
+                remove_virtual_range(address as usize, mbi.RegionSize);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        HEAP_BYTES.fetch_sub(size, Ordering::Relaxed);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -867,16 +978,20 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let title_limit = (gpu_optimal + standard).saturating_sub(TRANSFERRED.load(Ordering::Relaxed));
+    let physical_bytes = physical().pages.len() * PAGE;
+    let virtual_bytes = virtual_committed_bytes();
+    let heap_bytes = HEAP_BYTES.load(Ordering::Relaxed);
+    let tracked = physical_bytes
+        .saturating_add(virtual_bytes)
+        .saturating_add(heap_bytes);
+    // Keep title_used strictly below title_limit (when room exists) so host
+    // commit overhead never makes the title think it is over budget.
+    let title_used = tracked.max(PAGE).min(title_limit.saturating_sub(PAGE));
     let stats = WorkingSet {
-        title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_limit,
+        title_used,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
@@ -896,6 +1011,9 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            physical_mb = physical_bytes >> 20,
+            virtual_mb = virtual_bytes >> 20,
+            heap_mb = heap_bytes >> 20,
             "the title asks how much memory it uses"
         );
     }
@@ -1320,5 +1438,27 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn virtual_committed_tracks_recommits_and_frees() {
+        let before = virtual_committed_bytes();
+        let p = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert!(!p.is_null());
+        assert!(virtual_committed_bytes() >= before + 2 * PAGE);
+        // Re-committing the same range must not double-count.
+        let after_first = virtual_committed_bytes();
+        let same = XMemVirtualAlloc(p, 2 * PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert_eq!(same, p);
+        assert_eq!(virtual_committed_bytes(), after_first);
+        // Releasing via VirtualFree is pruned on query.
+        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert!(virtual_committed_bytes() <= after_first - 2 * PAGE);
+
+        let a32 = XMemAllocDefault(PAGE, ALLOC_32BIT);
+        assert!(!a32.is_null());
+        let with_32 = virtual_committed_bytes();
+        XMemFreeDefault(a32, ALLOC_32BIT);
+        assert!(virtual_committed_bytes() <= with_32 - PAGE);
     }
 }

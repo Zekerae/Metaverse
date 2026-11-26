@@ -158,6 +158,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    /// Render target slots bound with a null `ID3D12Resource*` (bit per slot).
+    null_targets: u8,
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
@@ -175,6 +177,7 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    depth_bounds: Option<(f32, f32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -186,6 +189,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Tables made afresh for the bound ambient stand-in dispatch: `(slot, first_heap_slot)`.
+    ambient_tables: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -511,8 +516,9 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.null_targets = 0;
         let mut rtvs = Vec::new();
-        for &h in handles {
+        for (slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -521,6 +527,9 @@ impl State {
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                if slot < 8 {
+                    self.null_targets |= 1 << slot;
+                }
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
@@ -601,6 +610,11 @@ impl State {
         crate::draw::stencil_ref(list, reference);
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        crate::draw::depth_bounds(list, min, max);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -636,6 +650,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some((min, max)) = self.depth_bounds {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
 
@@ -767,6 +784,10 @@ impl State {
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
+        }
+        if self.null_targets & p.rt_mask != 0 {
+            once!("a draw with a null render target view for a typed pipeline slot is dropped");
+            return false;
         }
         if !self.bind(list, p, false) {
             return false;
@@ -905,6 +926,10 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
+            }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -920,7 +945,14 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack = [0u32; 64];
+                let mut heap_buf = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    heap_buf.resize(dwords as usize, 0);
+                    &mut heap_buf
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1303,15 +1335,17 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        type Spans = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, Spans, u64)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, cached_spans, cached_bytes) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::new(), Vec::new(), 0));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let full_rescan = *passes % 16 == 0;
+        let slots = if full_rescan {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -1357,17 +1391,22 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        if full_rescan || !slots.is_empty() {
+            // Per host copy, the span its picked views cover.
+            let mut by_copy: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = by_copy.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            *cached_spans = by_copy.into_values().collect();
+            *cached_bytes = cached_spans.iter().map(|s| s.2 - s.1).sum();
         }
+        let spans = cached_spans.clone();
+        let bytes = *cached_bytes;
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1378,7 +1417,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1499,10 +1538,19 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        // Cap to 16 ms by default (`VICTORY_HEAP_TEXTURES_MS`) so streaming
+        // does not stall a 30 fps recording thread for 250 ms.
+        static SPAN: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        let span = *SPAN.get_or_init(|| {
+            let ms = std::env::var("VICTORY_HEAP_TEXTURES_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(16);
+            std::time::Duration::from_millis(ms)
+        });
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -1714,6 +1762,84 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: ambient::Role) -> bool {
+        use ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+        };
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format
+            || (seen.Width, seen.Height) != (of.Width, of.Height)
+            || volume != (role == Role::Air)
+        {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            return false;
+        }
+        ambient::after(
+            list,
+            role,
+            &Views {
+                image,
+                depth,
+                size: [of.Width as u32, of.Height],
+                slices: u32::from(of.DepthOrArraySize),
+            },
+        )
+    }
+
+    fn table_view(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        let heap = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()?;
+        t.used.iter().find(|u| {
+            u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+            View::Shader(r, _) | View::Unordered(r, ..) => r,
+            _ => return None,
+        };
+        let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+            Some(m) => m.1,
+            None => self.user_value(compute, slot, RootType::Table, 0),
+        };
+        let host = crate::resource::host_resource(resource as This)?;
+        // SAFETY: a live resource.
+        let desc = unsafe { host.GetDesc() };
+        Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2610,6 +2736,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -2689,4 +2816,577 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1;
+    use windows::core::Interface;
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Screen-space indirect-light stand-in (`VICTORY_AMBIENT`, Belobug / 7900XTX-ref)
+/// for dark interiors / unlit faces when ray tracing (`VICTORY_BVH_BUILDER`) is off.
+pub(crate) mod ambient {
+    use std::sync::{Mutex, OnceLock};
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::s;
+
+    use crate::host::{HostList, host};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Role {
+        Resolve,
+        Radiance,
+        Air,
+    }
+
+    pub(crate) fn role(container: &[u8]) -> Option<Role> {
+        let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+        if has(b"CS_ScreenProbes_TemporalResolve") {
+            Some(Role::Resolve)
+        } else if has(b"CS_CacheScreenSpaceRadiance") {
+            Some(Role::Radiance)
+        } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
+            Some(Role::Air)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const LIGHT: (u8, u32) = (1, 176);
+    pub(crate) const DEPTH: (u8, u32) = (0, 464);
+    pub(crate) const RADIANCE: (u8, u32) = (1, 16);
+    pub(crate) const AIR: (u8, u32) = (1, 32);
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Set {
+        Off,
+        Estimate(f32),
+        Constant(f32),
+    }
+
+    fn parse(set: &str) -> Set {
+        let set = set.trim();
+        let number = |t: &str| {
+            t.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+        };
+        match set.strip_prefix("constant:") {
+            Some(level) => number(level).map_or(Set::Off, Set::Constant),
+            None => number(set).map_or(Set::Off, Set::Estimate),
+        }
+    }
+
+    fn set() -> Set {
+        static SET: OnceLock<Set> = OnceLock::new();
+        *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    }
+
+    pub(crate) fn on() -> bool {
+        set() != Set::Off && !crate::pipeline::builder_runs()
+    }
+
+    fn air() -> f32 {
+        static SET: OnceLock<f32> = OnceLock::new();
+        *SET.get_or_init(|| {
+            let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
+            set.trim()
+                .parse()
+                .ok()
+                .filter(|v: &f32| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.0)
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    struct Settle {
+        ms: f32,
+        jump: f32,
+        fresh: f32,
+    }
+
+    fn settle() -> Option<Settle> {
+        static SET: OnceLock<Option<Settle>> = OnceLock::new();
+        *SET.get_or_init(|| {
+            let set =
+                std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
+            let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+            let ms = parts
+                .next()
+                .flatten()
+                .filter(|v| v.is_finite() && *v > 0.0)?;
+            let jump = parts
+                .next()
+                .flatten()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(3.0);
+            let fresh = parts
+                .next()
+                .flatten()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(0.0);
+            Some(Settle { ms, jump, fresh })
+        })
+    }
+
+    fn follow(role: Role) -> f32 {
+        match settle() {
+            Some(settle) if role == Role::Radiance => 1.0 - (-frame_ms(role) / settle.ms).exp(),
+            _ => 0.04,
+        }
+    }
+
+    fn frame_ms(role: Role) -> f32 {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static DT: AtomicU32 = AtomicU32::new(0x4204_0000);
+        if role != Role::Radiance {
+            return f32::from_bits(DT.load(Relaxed));
+        }
+        static ASKED: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        if ASKED.swap(now, Relaxed) == now {
+            return f32::from_bits(DT.load(Relaxed));
+        }
+        let last = LAST.swap(now, Relaxed);
+        let dt = match now.saturating_sub(last) {
+            0 => 1.0,
+            dt if last == 0 || dt > 1000 => 33.0,
+            dt => dt as f32,
+        };
+        DT.store(dt.to_bits(), Relaxed);
+        dt
+    }
+
+    fn shade() -> [f32; 2] {
+        static SET: OnceLock<[f32; 2]> = OnceLock::new();
+        *SET.get_or_init(|| {
+            let mut shade = [1.0, 0.6];
+            let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
+            for (to, v) in shade.iter_mut().zip(set.split(',')) {
+                if let Ok(v) = v.trim().parse() {
+                    *to = v;
+                }
+            }
+            shade
+        })
+    }
+
+    const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define CX 64
+#define CY 36
+#define CELLS (CX * CY)
+#define PX 160
+#define PY 90
+cbuffer Set : register(b0) {
+    float level; float constant; float strength; float radius;
+    float near; float tan_y; uint width; uint height;
+    float follow; float most; float air; uint probe;
+    float jump; float fresh; float dt;
+};
+Texture2D<float> depth : register(t0);
+RWStructuredBuffer<float4> cells : register(u1);
+RWStructuredBuffer<float4> points : register(u2);
+RWByteAddressBuffer stats : register(u3);
+static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+
+float3 seen(int2 p, float2 size) {
+    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+    float z = min(near / max(d, 1e-7), 1000.0);
+    float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
+    return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
+}
+
+#ifdef KEEP
+RWTexture2D<float3> radiance : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 4, 1)]
+void keep(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    radiance.GetDimensions(w, h);
+    float3 sum = 0;
+    for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
+        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
+        float3 c = max(radiance[p], 0.0);
+        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+    }
+    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
+}
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void mean() {
+    float3 sum = 0;
+    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    float4 was = cells[CELLS];
+    float3 now = sum / CELLS;
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
+}
+#endif
+
+#ifdef PLACE
+[RootSignature(RS)]
+[numthreads(8, 4, 1)]
+void place(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
+    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+}
+#endif
+
+#ifdef GATHER
+[RootSignature(RS)]
+[numthreads(8, 2, 1)]
+void gather(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float whole = 0;
+    float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        float4 c = cells[CELLS + 1 + i];
+        float3 L = cells[i].rgb;
+        float3 d = c.xyz - p;
+        float dd = dot(d, d);
+        float w = c.w / (dd + r2);
+        float3 dir = d / sqrt(dd + 0.25 * r2);
+        whole += w;
+        toward += w * dir;
+        light += w * L;
+        red += w * L.r * dir;
+        green += w * L.g * dir;
+        blue += w * L.b * dir;
+    }
+    whole = max(whole, 1e-6);
+    light /= whole;
+    toward /= whole;
+    uint at0 = (at.y * PX + at.x) * 3;
+    points[at0] = float4(red / whole - light.r * toward, light.r);
+    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
+    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+}
+#endif
+
+#ifdef AIR
+RWTexture3D<float3> scattered : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 2)]
+void clear_air(uint3 at : SV_DispatchThreadID) {
+    uint w, h, d;
+    scattered.GetDimensions(w, h, d);
+    if (at.x >= w || at.y >= h || at.z >= d) return;
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float far = float(at.z) / float(d);
+    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float3 c = scattered[at];
+    float has = dot(c, LUMA);
+    if (has > cap) scattered[at] = c * (cap / has);
+}
+#endif
+
+#ifdef RAISE
+RWTexture2D<uint> light : register(u0);
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void raise(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    if (at.x >= width || at.y >= height) return;
+    int2 p = int2(at.xy);
+    float3 c = seen(p, size);
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    float open = 1.0;
+    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+    float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
+    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+        float sum = 0.0;
+        const int N = 12;
+        for (int i = 0; i < N; i++) {
+            float a = i * 2.399963 + noise * 6.2831853;
+            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+            float3 v = seen(p + int2(round(o)), size) - c;
+            float vv = dot(v, v);
+            float over = dot(v, n) - 0.004 * c.z - 0.005;
+            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+        }
+        open = saturate(1.0 - strength * 2.0 * sum / N);
+    }
+    float3 found;
+    if (constant > 0.0) {
+        found = float3(1.0, 0.98, 0.94) * constant * open;
+        light[p] = pack(found);
+        return;
+    }
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += w * points[at0];
+        sg += w * points[at0 + 1];
+        sb += w * points[at0 + 2];
+        sum += w;
+    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float3 was = unpack(light[p]);
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
+    float has = dot(was, LUMA);
+    was *= min(1.0, top / max(has, 1e-6));
+    float3 written = max(was, found);
+    light[p] = pack(written);
+}
+#endif
+"#;
+
+    const CELLS: u64 = 64 * 36;
+    const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+    const POINT_BYTES: u64 = 160 * 90 * 48;
+
+    struct Pass {
+        root: ID3D12RootSignature,
+        keep: ID3D12PipelineState,
+        mean: ID3D12PipelineState,
+        place: ID3D12PipelineState,
+        gather: ID3D12PipelineState,
+        raise: ID3D12PipelineState,
+        air: ID3D12PipelineState,
+        cells: ID3D12Resource,
+        points: ID3D12Resource,
+        stats: ID3D12Resource,
+    }
+    // SAFETY: D3D12 resources, pipelines, and root signatures are thread-safe.
+    unsafe impl Send for Pass {}
+    unsafe impl Sync for Pass {}
+
+    fn make(
+        device: &ID3D12Device,
+        buffer: impl Fn(u64) -> Option<ID3D12Resource>,
+    ) -> windows::core::Result<Pass> {
+        let mut root: Option<ID3D12RootSignature> = None;
+        let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
+            let code =
+                crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+            unsafe {
+                if root.is_none() {
+                    root = Some(device.CreateRootSignature(0, &code)?);
+                }
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                };
+                device.CreateComputePipelineState(&desc)
+            }
+        };
+        let keep = pipeline("KEEP", s!("keep"))?;
+        let mean = pipeline("KEEP", s!("mean"))?;
+        let place = pipeline("PLACE", s!("place"))?;
+        let gather = pipeline("GATHER", s!("gather"))?;
+        let raise = pipeline("RAISE", s!("raise"))?;
+        let air = pipeline("AIR", s!("clear_air"))?;
+        let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
+        Ok(Pass {
+            root: root.ok_or_else(windows::core::Error::empty)?,
+            keep,
+            mean,
+            place,
+            gather,
+            raise,
+            air,
+            cells: made(CELL_BYTES)?,
+            points: made(POINT_BYTES)?,
+            stats: made(256)?,
+        })
+    }
+
+    fn pass() -> Option<&'static Pass> {
+        static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+        PASS.get_or_init(|| {
+            let host = host()?;
+            make(&host.device, |bytes| host.uav_buffer(bytes))
+                .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
+                .ok()
+        })
+        .as_ref()
+    }
+
+    fn uav_barrier(list: &ID3D12GraphicsCommandList) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            ..Default::default()
+        };
+        unsafe { list.ResourceBarrier(&[barrier]) };
+    }
+
+    static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) struct Views {
+        pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
+        pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+        pub(crate) size: [u32; 2],
+        pub(crate) slices: u32,
+    }
+
+    pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(pass) = pass() else {
+            return false;
+        };
+        let (level, constant) = match set() {
+            Set::Off => return false,
+            Set::Estimate(level) => (level, 0.0f32),
+            Set::Constant(level) => (0.0, level),
+        };
+        if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+            return false;
+        }
+        if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+            return false;
+        }
+        static SAID: Mutex<u32> = Mutex::new(0);
+        {
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if *said < 4 {
+                *said += 1;
+                tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            }
+        }
+        list.keep(&pass.cells);
+        list.keep(&pass.points);
+        list.keep(&pass.stats);
+        let [strength, radius] = shade();
+        let floats = [level, constant, strength, radius, 0.1, 0.45];
+        let mut words = [0u32; 15];
+        for (to, v) in words.iter_mut().zip(floats) {
+            *to = v.to_bits();
+        }
+        words[6] = views.size[0];
+        words[7] = views.size[1];
+        words[8] = follow(role).to_bits();
+        words[9] = 4.0f32.to_bits();
+        words[10] = air().to_bits();
+        words[11] = 0;
+        words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
+        words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
+        words[14] = (frame_ms(role) / 1000.0).to_bits();
+        let l = &list.list;
+        // SAFETY: open list with view heap bound and buffers kept by list.
+        unsafe {
+            uav_barrier(l);
+            l.SetComputeRootSignature(&pass.root);
+            l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+            l.SetComputeRootDescriptorTable(1, views.depth);
+            l.SetComputeRootDescriptorTable(2, views.image);
+            l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
+            let run = |pso: &ID3D12PipelineState, x, y, z| {
+                l.SetPipelineState(pso);
+                l.Dispatch(x, y, z);
+                uav_barrier(l);
+            };
+            match role {
+                Role::Radiance => {
+                    run(&pass.keep, 8, 9, 1);
+                    run(&pass.mean, 1, 1, 1);
+                    KEPT.store(true, Ordering::Relaxed);
+                }
+                Role::Air => run(
+                    &pass.air,
+                    views.size[0].div_ceil(8),
+                    views.size[1].div_ceil(8),
+                    views.slices.div_ceil(2),
+                ),
+                Role::Resolve => {
+                    if constant == 0.0 {
+                        run(&pass.place, 8, 9, 1);
+                        run(&pass.gather, 20, 45, 1);
+                    }
+                    run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                }
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn settings() {
+            assert_eq!(parse(""), Set::Off);
+            assert_eq!(parse("off"), Set::Off);
+            assert_eq!(parse("0"), Set::Off);
+            assert_eq!(parse("0.8"), Set::Estimate(0.8));
+            assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
+            assert_eq!(parse("constant:nan"), Set::Off);
+        }
+
+        #[test]
+        fn roles_by_name() {
+            assert_eq!(
+                role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."),
+                Some(Role::Resolve)
+            );
+            assert_eq!(
+                role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."),
+                Some(Role::Radiance)
+            );
+            assert_eq!(
+                role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"),
+                Some(Role::Air)
+            );
+            assert_eq!(role(b"CS_TemporalResolve"), None);
+        }
+
+        #[test]
+        fn the_passes_build() {
+            let Some(host) = host() else {
+                return;
+            };
+            make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        }
+    }
 }

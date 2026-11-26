@@ -39,6 +39,18 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn parse_interval_override(raw: Option<&str>) -> Option<Duration> {
+    let us = raw?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_micros(us))
+}
+
+fn interval_override() -> Option<Duration> {
+    static CAP: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        parse_interval_override(std::env::var("VICTORY_FRAME_INTERVAL_US").ok().as_deref())
+    })
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -49,11 +61,15 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let requested = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = match interval_override() {
+        Some(cap) => requested.min(cap),
+        None => requested,
+    };
+    tracing::info!(?interval, ?requested, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -242,5 +258,16 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+    }
+
+    #[test]
+    fn interval_override_parses() {
+        assert_eq!(parse_interval_override(None), None);
+        assert_eq!(parse_interval_override(Some("bad")), None);
+        assert_eq!(
+            parse_interval_override(Some(" 16667 ")),
+            Some(Duration::from_micros(16_667))
+        );
+        assert_eq!(parse_interval_override(Some("0")), Some(Duration::ZERO));
     }
 }

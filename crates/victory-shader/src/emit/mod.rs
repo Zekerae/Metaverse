@@ -159,6 +159,13 @@ pub fn loop_limit() -> u32 {
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
+/// Whether a pixel-shader helper lane takes its own value in `first_lane`
+/// (`VICTORY_HELPER_OWN=0` disables).
+pub fn helper_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
 pub fn group_sync() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
@@ -297,6 +304,15 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// Whether `VICTORY_WAVE_WHY=1` diagnostics are enabled (diagnostics builds only).
+pub(super) fn wave_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_WAVE_WHY").is_some_and(|v| v == "1")
+    })
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -323,12 +339,13 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-        let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+        let why = wave_why();
+        let mut notes: Vec<String> = Vec::new();
+        let mut report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => notes.push(format!("{what}: wave {wave:?}")),
+                    Err(e) => notes.push(format!("{what}: {e}")),
                 }
             }
         };
@@ -461,6 +478,9 @@ pub fn emit(
                 }
             }
         }
+        if why && !notes.is_empty() {
+            eprintln!("WAVE64-RETRY summary (stuck): {}", notes.join(" | "));
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -471,7 +491,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, wave_why());
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -479,7 +499,19 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let finish = |r: Result<(HostShader, Option<u32>), ShaderError>| -> Result<HostShader, ShaderError> {
+        match r {
+            Ok((_, Some(64))) if native.stage == HwStage::Cs && lower::host_max_wave() == 32 => {
+                Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "64-lane waves on a 32-lane host",
+                })
+            }
+            Ok((shader, _)) => Ok(shader),
+            Err(e) => Err(e),
+        }
+    };
+    let original = finish(original);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -493,7 +525,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    finish(emit_program(c, native, &p, &st, &io, &res))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -1739,5 +1771,77 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn cube_gradient_uses_dxil_log2_directly_and_validates() {
+        use crate::native::ComputeIo;
+        use crate::{ResourceType, RootParam, UsedResource};
+        let mut words = vec![
+            0xBE81_0380,
+            0xBE83_0380,
+            0xF40C_0400,
+            0xFA00_0000,
+            0xF408_0300,
+            0xFA00_0020,
+            0xF408_0601,
+            0xFA00_0000,
+            0x7E1E_0280,
+        ];
+        for (i, &(op, footprint, lod)) in [(0x22u32, 2.0f32, 0.0f32), (0x23, 2.0, 3.0)].iter().enumerate() {
+            let delta = footprint / 64.0;
+            let mut addr = vec![delta, 0.0, 0.0, delta, 1.5, 1.5, 0.0];
+            if op == 0x23 {
+                addr.push(lod);
+            }
+            for (reg, value) in addr.iter().enumerate() {
+                words.extend([0x7E00_02FF | ((reg as u32) << 17), value.to_bits()]);
+            }
+            words.extend([0xF000_0118 | (op << 18), 0x00C4_0A00]);
+            words.extend([0xE070_1000 | (i as u32 * 4), 0x8003_0A0F]);
+        }
+        words.push(0xBF81_0000);
+        let table = |slot, user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let range = |kind, at, words, slot, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 0,
+            dwords: words,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![table(0, 0), table(1, 2)],
+            used: vec![
+                range(ResourceType::Srv, 0, 8, 0, 0),
+                range(ResourceType::Uav, 8, 4, 0, 0),
+                range(ResourceType::Sampler, 0, 4, 1, 2),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let container_bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&container_bytes).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        validate(&shader);
     }
 }

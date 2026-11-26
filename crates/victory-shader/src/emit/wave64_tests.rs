@@ -450,3 +450,29 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A 64-lane console wave using `v_permlanex16_b32` outside a reduction tree:
+/// stays within 32-lane halves (`wave = 32` on a 32-lane host) and reads the
+/// other 16-lane row (`lane 0` reads `lane 16`, storing `16`).
+#[test]
+fn permlanex16_reads_other_row_in_32_lane_half() {
+    let words = [
+        0xD778_0002,
+        0x0201_0100, // v_permlanex16_b32 v2, v0, 0, 0
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 2 << 8, // buffer_store_dword v2, off, s[8:11], 0
+    ];
+    let native = native_of(&words, true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    lower::TEST_HOST_WAVE.set(was);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = on_the_card(&shader, [0, 0]) else { return };
+    assert_eq!(got, 16);
+}
